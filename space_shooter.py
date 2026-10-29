@@ -25,6 +25,12 @@ Where each concept from "Required Understanding" lives in the code
                      in memory). If you add PNG/WAV files, load them with
                      pygame.image.load / pygame.mixer.Sound from an "assets" folder.
 """
+"""
+EF101-P05  -  Python-Based 2D Game: "STAR DEFENDER" (space shooter)
+
+Run:      pip install pygame
+          python space_shooter.py
+"""
 
 import array
 import json
@@ -32,15 +38,37 @@ import math
 import os
 import random
 import sys
+import threading
+import urllib.parse
+import urllib.request
+import uuid
 
 import pygame
+import ssl
 
 # --------------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------------
 WIDTH, HEIGHT = 800, 700
 FPS = 60
-SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "savedata.json")
+def _get_save_file():
+    """Store preferences and a persistent random device ID outside the game folder."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    folder = os.path.join(base, "StarDefender")
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError:
+        # Last-resort fallback: user home, not the game/EXE directory.
+        folder = os.path.expanduser("~")
+    return os.path.join(folder, "savedata.json")
+
+
+SAVE_FILE = _get_save_file()
 POINTS_PER_LEVEL = 300          # score needed to advance one level
 START_LIVES = 3
 MAX_LIVES = 5
@@ -59,37 +87,143 @@ GREY = (140, 145, 165)
 
 TITLE, PLAYING, PAUSED, GAME_OVER = "title", "playing", "paused", "game_over"
 
+API_URL = os.environ.get("SPACE_SHOOTER_API_URL", "https://space-shooter-game-score.vercel.app/api/score").rstrip("/")
+
 
 # --------------------------------------------------------------------------
-# Persistent storage (high score + settings)
+# Persistent & Online Storage
 # --------------------------------------------------------------------------
 class SaveData:
-    """Stores the high score and the mute setting in savedata.json."""
+    """Local preferences plus asynchronous online leaderboard access.
+
+    The game remains playable without a network connection. No Redis credentials
+    belong in this client; those are configured on the Vercel server.
+    """
 
     def __init__(self):
+        self.device_id = ""
         self.high_score = 0
         self.muted = False
-        self.load()
+        self.player_name = "PLAYER1"
+        self.device_scores = {}
+        self.global_scores = []
+        self.online_status = "LOADING ONLINE LEADERBOARD..."
+        self._fetch_in_progress = False
+        self.load_local()
+        if not self.device_id:
+            self.device_id = str(uuid.uuid4())
+            self.save_local()
+        self.fetch_online()
 
-    def load(self):
+    def load_local(self):
         try:
             with open(SAVE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            self.high_score = int(data.get("high_score", 0))
+            self.high_score = max(0, int(data.get("high_score", 0)))
             self.muted = bool(data.get("muted", False))
-        except (OSError, ValueError):
-            pass  # first run or corrupted file -> keep defaults
+            name = str(data.get("player_name", "PLAYER1"))
+            self.player_name = name[:12] or "PLAYER1"
+            self.device_id = str(data.get("device_id", ""))
+        except (OSError, ValueError, TypeError):
+            pass
 
-    def save(self):
+    def save_local(self):
         try:
+            os.makedirs(os.path.dirname(SAVE_FILE), exist_ok=True)
             with open(SAVE_FILE, "w", encoding="utf-8") as f:
-                json.dump({"high_score": self.high_score, "muted": self.muted}, f)
-        except OSError:
-            print("Warning: could not write save file.")
+                json.dump({
+                    "device_id": self.device_id,
+                    "high_score": self.high_score,
+                    "muted": self.muted,
+                    "player_name": self.player_name
+                }, f)
+        except (OSError, TypeError):
+            pass
 
+    def fetch_online(self):
+        """Fetch scores in a background thread so the game loop never stalls."""
+        if self._fetch_in_progress:
+            return
+        self._fetch_in_progress = True
+
+        def fetch():
+            try:
+                query = urllib.parse.urlencode({"device_id": self.device_id})
+                req = urllib.request.Request(
+                    f"{API_URL}?{query}",
+                    headers={"Accept": "application/json", "User-Agent": "StarDefender/1.0"},
+                    method="GET"
+                )
+                with urllib.request.urlopen(req, timeout=4) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+                device_scores = data.get("device_scores", {})
+                global_scores = data.get("global_scores", [])
+                if not isinstance(device_scores, dict):
+                    device_scores = {}
+                if not isinstance(global_scores, list):
+                    global_scores = []
+                # Normalize server data so malformed entries cannot break drawing.
+                clean_scores = []
+                for entry in global_scores:
+                    if not isinstance(entry, dict):
+                        continue
+                    try:
+                        score = max(0, int(entry.get("score", 0)))
+                    except (TypeError, ValueError):
+                        continue
+                    name = str(entry.get("name", "PLAYER"))[:12]
+                    clean_scores.append({"name": name, "score": score})
+                self.device_scores = device_scores
+                self.global_scores = clean_scores[:10]
+                try:
+                    own_best = int(self.device_scores.get(self.player_name, 0))
+                    self.high_score = max(self.high_score, own_best)
+                except (TypeError, ValueError):
+                    pass
+                self.online_status = "ONLINE LEADERBOARD"
+            except Exception:
+                self.online_status = "OFFLINE - LEADERBOARD UNAVAILABLE"
+            finally:
+                self._fetch_in_progress = False
+
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def submit_score_online(self, score_to_submit):
+        """Submit only at Game Over; the game itself never waits for the request."""
+        try:
+            score_to_submit = int(score_to_submit)
+        except (TypeError, ValueError):
+            return
+        name = self.player_name.strip()[:12]
+        if score_to_submit <= 0 or not name:
+            return
+
+        def push():
+            try:
+                payload = json.dumps({
+                    "device_id": self.device_id,
+                    "name": name,
+                    "score": score_to_submit
+                }).encode("utf-8")
+                req = urllib.request.Request(
+                    API_URL,
+                    data=payload,
+                    headers={"Content-Type": "application/json", "Accept": "application/json"},
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=4) as response:
+                    if response.status < 200 or response.status >= 300:
+                        raise RuntimeError(f"Score API returned HTTP {response.status}")
+                # Refresh after the POST completes. fetch_online itself is async.
+                self.online_status = "SCORE SUBMITTED - REFRESHING..."
+                self.fetch_online()
+            except Exception:
+                self.online_status = "OFFLINE - SCORE NOT UPLOADED"
+
+        threading.Thread(target=push, daemon=True).start()
 
 # --------------------------------------------------------------------------
-# Sound (synthesised, so no external files needed)
+# Sound
 # --------------------------------------------------------------------------
 class SoundManager:
     RATE = 44100
@@ -142,11 +276,9 @@ class SoundManager:
 
 
 # --------------------------------------------------------------------------
-# Game objects
+# Game Objects
 # --------------------------------------------------------------------------
 class Starfield:
-    """Scrolling background stars with 3 depth layers (parallax)."""
-
     def __init__(self):
         self.stars = [
             [random.uniform(0, WIDTH), random.uniform(0, HEIGHT), random.choice((30, 60, 110))]
@@ -187,8 +319,6 @@ class Particle:
 
 
 class Bullet:
-    """Player bullet - travels straight up."""
-
     def __init__(self, x, y, vx=0):
         self.x, self.y, self.vx = x, y, vx
         self.rect = pygame.Rect(0, 0, 6, 16)
@@ -224,8 +354,6 @@ class EnemyBullet:
 
 
 class Rocket:
-    """Bonus rocket: flies up fast, then detonates and wipes out every enemy."""
-
     def __init__(self, x, y):
         self.x, self.y = x, y
         self.rect = pygame.Rect(0, 0, 14, 34)
@@ -257,18 +385,17 @@ class Player:
         self.x, self.y = WIDTH / 2, HEIGHT - 80
         self.lives = START_LIVES
         self.cooldown = 0.0
-        self.invulnerable = 0.0   # seconds of protection after being hit
-        self.rapid = 0.0          # seconds of rapid fire left
-        self.shield = 0.0         # seconds of shield left
+        self.invulnerable = 0.0
+        self.rapid = 0.0
+        self.shield = 0.0
         self.rockets = START_ROCKETS
         self.rect.center = (self.x, self.y)
 
     @property
     def hitbox(self):
-        return self.rect.inflate(-14, -10)   # slightly forgiving collisions
+        return self.rect.inflate(-14, -10)
 
     def handle_input(self, keys, dt):
-        """Held-key movement (continuous), scaled by dt so speed is frame-rate independent."""
         dx = (keys[pygame.K_RIGHT] or keys[pygame.K_d]) - (keys[pygame.K_LEFT] or keys[pygame.K_a])
         dy = (keys[pygame.K_DOWN] or keys[pygame.K_s]) - (keys[pygame.K_UP] or keys[pygame.K_w])
         if dx and dy:
@@ -287,7 +414,6 @@ class Player:
         self.shield = max(0, self.shield - dt)
 
     def try_shoot(self):
-        """Return a list of new bullets (empty if still cooling down)."""
         if self.cooldown > 0:
             return []
         self.cooldown = 0.11 if self.rapid > 0 else 0.26
@@ -296,17 +422,13 @@ class Player:
         return [Bullet(self.x, self.y - 26)]
 
     def draw(self, surf):
-        # Blink while invulnerable
         if self.invulnerable > 0 and int(self.invulnerable * 12) % 2 == 0:
             return
         x, y = self.x, self.y
-        # engine flame (flickers)
         flame = random.randint(10, 20)
         pygame.draw.polygon(surf, ORANGE, [(x - 8, y + 20), (x + 8, y + 20), (x, y + 20 + flame)])
-        # wings
         pygame.draw.polygon(surf, (60, 120, 200), [(x - 22, y + 20), (x - 6, y - 4), (x - 6, y + 20)])
         pygame.draw.polygon(surf, (60, 120, 200), [(x + 22, y + 20), (x + 6, y - 4), (x + 6, y + 20)])
-        # body
         pygame.draw.polygon(surf, (190, 210, 240), [(x, y - 26), (x + 10, y + 20), (x - 10, y + 20)])
         pygame.draw.circle(surf, CYAN, (int(x), int(y - 4)), 5)
         if self.shield > 0:
@@ -314,10 +436,7 @@ class Player:
 
 
 class Enemy:
-    """kind: 'drone' (straight), 'zigzag' (sine path), 'gunner' (shoots), 'asteroid' (tough)."""
-
     STATS = {
-        #  hp, points, width, height
         "drone": (1, 10, 36, 32),
         "zigzag": (2, 20, 36, 32),
         "gunner": (3, 40, 46, 38),
@@ -357,7 +476,7 @@ class Enemy:
         elif self.kind == "gunner":
             if self.y < 110:
                 self.y += self.vy * dt
-            else:   # hover and strafe sideways
+            else:
                 self.x += self.dir * 110 * dt
                 if self.x < 40 or self.x > WIDTH - 40:
                     self.dir *= -1
@@ -381,7 +500,7 @@ class Enemy:
             pygame.draw.ellipse(surf, (200, 90, 60), (x - 23, y - 12, 46, 24))
             pygame.draw.rect(surf, GREY, (x - 4, y + 6, 8, 16))
             pygame.draw.circle(surf, YELLOW, (x, y - 2), 6)
-        else:  # asteroid
+        else:
             c, s = math.cos(self.angle), math.sin(self.angle)
             pts = [(x + px * c - py * s, y + px * s + py * c) for px, py in self.rock]
             pygame.draw.polygon(surf, (120, 110, 100), pts)
@@ -409,7 +528,7 @@ class PowerUp:
 
 
 # --------------------------------------------------------------------------
-# The game itself
+# Main Game Class
 # --------------------------------------------------------------------------
 class Game:
     def __init__(self):
@@ -432,7 +551,6 @@ class Game:
         self.state = TITLE
         self.new_high = False
 
-    # ---- state management -------------------------------------------------
     def new_game(self):
         self.player.reset()
         self.bullets, self.enemies, self.enemy_bullets = [], [], []
@@ -440,10 +558,10 @@ class Game:
         self.score = 0
         self.level = 1
         self.spawn_timer = 1.0
-        self.banner_time = 2.0       # "LEVEL n" banner
-        self.rocket = None           # the rocket currently in flight (if any)
-        self.flash = 0.0             # white screen-flash timer for the blast
-        self.rocket_reward = False   # show "+1 ROCKET" on the level banner
+        self.banner_time = 2.0
+        self.rocket = None
+        self.flash = 0.0
+        self.rocket_reward = False
         self.new_high = False
         self.state = PLAYING
 
@@ -454,18 +572,18 @@ class Game:
         if self.score > self.save.high_score:
             self.save.high_score = self.score
             self.new_high = True
-        self.save.save()
+        self.save.save_local()
+        # Submit score only when the game session ends
+        if self.score > 0:
+            self.save.submit_score_online(self.score)
 
     def toggle_mute(self):
         self.sound.toggle_mute()
         self.save.muted = self.sound.muted
-        self.save.save()
+        self.save.save_local()
 
-    # ---- main loop ---------------------------------------------------------
     def run(self):
         while True:
-            # dt = seconds since the previous frame. Multiplying speeds by dt keeps
-            # movement identical on slow and fast computers.
             dt = min(self.clock.tick(FPS) / 1000.0, 0.05)
             self.handle_events()
             self.update(dt)
@@ -473,11 +591,11 @@ class Game:
             pygame.display.flip()
 
     def quit(self):
-        self.save.save()
+        # Quitting is not a completed run: scores upload only from end_game().
+        self.save.save_local()
         pygame.quit()
         sys.exit()
 
-    # ---- input -------------------------------------------------------------
     def handle_events(self):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -489,9 +607,15 @@ class Game:
                 self.toggle_mute()
             if self.state == TITLE:
                 if key in (pygame.K_RETURN, pygame.K_SPACE):
-                    self.new_game()
+                    if self.save.player_name.strip():
+                        self.save.high_score = self.save.device_scores.get(self.save.player_name, self.save.high_score)
+                        self.new_game()
                 elif key == pygame.K_ESCAPE:
                     self.quit()
+                elif key == pygame.K_BACKSPACE:
+                    self.save.player_name = self.save.player_name[:-1]
+                elif event.unicode.isprintable() and len(self.save.player_name) < 12 and event.unicode != " ":
+                    self.save.player_name += event.unicode.upper()
             elif self.state == PLAYING:
                 if key in (pygame.K_p, pygame.K_ESCAPE):
                     self.state = PAUSED
@@ -508,7 +632,6 @@ class Game:
                 elif key == pygame.K_ESCAPE:
                     self.state = TITLE
 
-    # ---- update ------------------------------------------------------------
     def update(self, dt):
         self.stars.update(dt, 1.0 if self.state != PAUSED else 0.0)
         if self.state != PLAYING:
@@ -541,21 +664,18 @@ class Game:
         self.update_rocket(dt)
         self.check_collisions()
 
-        # remove objects that left the screen
         self.bullets = [b for b in self.bullets if -30 < b.y < HEIGHT + 30 and -30 < b.x < WIDTH + 30]
         self.enemies = [e for e in self.enemies if e.y < HEIGHT + 60]
-        self.enemy_bullets = [eb for eb in self.enemy_bullets
-                              if -30 < eb.x < WIDTH + 30 and -30 < eb.y < HEIGHT + 30]
+        self.enemy_bullets = [eb for eb in self.enemy_bullets if -30 < eb.x < WIDTH + 30 and -30 < eb.y < HEIGHT + 30]
         self.powerups = [pu for pu in self.powerups if pu.y < HEIGHT + 30]
 
-        # progression: new level every POINTS_PER_LEVEL points (no upper limit)
         new_level = self.score // POINTS_PER_LEVEL + 1
         if new_level > self.level:
             self.level = new_level
             self.banner_time = 2.0
             self.sound.play("levelup")
             before = self.player.rockets
-            self.player.rockets = min(MAX_ROCKETS, before + 1)   # reward for reaching a new level
+            self.player.rockets = min(MAX_ROCKETS, before + 1)
             self.rocket_reward = self.player.rockets > before
         self.banner_time = max(0, self.banner_time - dt)
 
@@ -568,7 +688,6 @@ class Game:
         self.spawn_timer -= dt
         if self.spawn_timer > 0:
             return
-        # Difficulty rises with the level: faster spawns, tougher enemy mix.
         self.spawn_timer = max(0.3, 1.2 - 0.1 * (self.level - 1)) * random.uniform(0.7, 1.3)
         pool = ["drone", "drone", "asteroid"]
         if self.level >= 2:
@@ -580,7 +699,6 @@ class Game:
         self.enemies.append(Enemy(random.choice(pool), self.level))
 
     def fire_rocket(self):
-        """Launch the bonus rocket (only one in flight, and you need one in stock)."""
         p = self.player
         if self.rocket is None and p.rockets > 0:
             p.rockets -= 1
@@ -593,15 +711,13 @@ class Game:
         if r is None:
             return
         r.update(dt)
-        # detonate when it hits an enemy or reaches the upper part of the screen
         if r.y < 150 or any(r.rect.colliderect(e.rect) for e in self.enemies):
             self.detonate(r.x, r.y)
             self.rocket = None
 
     def detonate(self, x, y):
-        """Big blast: every enemy and enemy bullet on screen is destroyed."""
         for e in self.enemies:
-            self.destroy_enemy(e, drop=False)   # still scores points for each enemy
+            self.destroy_enemy(e, drop=False)
         self.enemies = []
         self.enemy_bullets = []
         self.explode(x, y, WHITE, 70)
@@ -631,10 +747,8 @@ class Game:
             self.end_game()
 
     def check_collisions(self):
-        """Axis-aligned rectangle overlap tests (Rect.colliderect)."""
         p = self.player
 
-        # player bullets vs enemies
         for b in self.bullets[:]:
             for e in self.enemies:
                 if b.rect.colliderect(e.rect):
@@ -650,7 +764,6 @@ class Game:
         if self.state != PLAYING:
             return
 
-        # enemies vs player
         for e in self.enemies[:]:
             if p.hitbox.colliderect(e.rect):
                 self.enemies.remove(e)
@@ -660,7 +773,6 @@ class Game:
                 if self.state != PLAYING:
                     return
 
-        # enemy bullets vs player
         for eb in self.enemy_bullets[:]:
             if p.hitbox.colliderect(eb.rect):
                 self.enemy_bullets.remove(eb)
@@ -668,7 +780,6 @@ class Game:
                 if self.state != PLAYING:
                     return
 
-        # power-ups vs player
         for pu in self.powerups[:]:
             if p.hitbox.colliderect(pu.rect):
                 self.powerups.remove(pu)
@@ -688,7 +799,7 @@ class Game:
             kind = random.choices(["rapid", "shield", "life"], weights=[4, 4, 2])[0]
             self.powerups.append(PowerUp(e.x, e.y, kind, self.font_small))
 
-    # ---- drawing -----------------------------------------------------------
+    # ---- Drawing -----------------------------------------------------------
     def draw_text(self, text, font, color, center=None, topleft=None, topright=None):
         img = font.render(text, True, color)
         rect = img.get_rect()
@@ -722,10 +833,11 @@ class Game:
             self.player.draw(self.screen)
         for pt in self.particles:
             pt.draw(self.screen)
-        if self.flash > 0:   # white flash fading out after the blast
+        if self.flash > 0:
             fl = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
             fl.fill((255, 255, 255, int(200 * self.flash / 0.5)))
             self.screen.blit(fl, (0, 0))
+        
         self.draw_hud()
 
         if self.banner_time > 0 and self.state == PLAYING:
@@ -739,36 +851,54 @@ class Game:
                      "NEW HIGH SCORE!" if self.new_high else f"High score: {self.save.high_score}",
                      "R - play again    ESC - title screen"]
             self.draw_overlay("GAME OVER", lines, RED)
+            self.draw_leaderboard_overlay()
 
     def draw_overlay(self, title, lines, color=WHITE):
         shade = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         shade.fill((0, 0, 0, 150))
         self.screen.blit(shade, (0, 0))
-        self.draw_text(title, self.font_big, color, center=(WIDTH // 2, HEIGHT // 2 - 90))
+        self.draw_text(title, self.font_big, color, center=(WIDTH // 2, HEIGHT // 2 - 140))
         for i, line in enumerate(lines):
             c = GREEN if line == "NEW HIGH SCORE!" else WHITE
-            self.draw_text(line, self.font, c, center=(WIDTH // 2, HEIGHT // 2 - 10 + i * 40))
+            self.draw_text(line, self.font, c, center=(WIDTH // 2, HEIGHT // 2 - 60 + i * 40))
+
+    def draw_leaderboard_overlay(self):
+        """Draws the global top scores directly on the Game Over screen."""
+        panel = pygame.Surface((340, 210), pygame.SRCALPHA)
+        panel.fill((15, 20, 35, 220))
+        pygame.draw.rect(panel, CYAN, panel.get_rect(), 2, border_radius=6)
+        self.screen.blit(panel, (WIDTH // 2 - 170, HEIGHT // 2 + 70))
+        
+        self.draw_text("GLOBAL LEADERBOARD", self.font_small, YELLOW, center=(WIDTH // 2, HEIGHT // 2 + 90))
+        if not self.save.global_scores:
+            self.draw_text(self.save.online_status[:34], self.font_small, GREY,
+                           center=(WIDTH // 2, HEIGHT // 2 + 130))
+            return
+        for idx, entry in enumerate(self.save.global_scores[:5]):
+            line = f"{idx+1}. {entry['name']:<10} {entry['score']:>6}"
+            color = GREEN if entry['name'] == self.save.player_name else WHITE
+            self.draw_text(line, self.font_small, color, center=(WIDTH // 2, HEIGHT // 2 + 120 + idx * 24))
 
     def draw_hud(self):
         p = self.player
         self.draw_text(f"SCORE {self.score}", self.font, WHITE, topleft=(14, 10))
         self.draw_text(f"BEST {max(self.save.high_score, self.score)}", self.font_small, GREY, topleft=(14, 40))
         self.draw_text(f"LEVEL {self.level}", self.font, YELLOW, topright=(WIDTH - 14, 10))
-        # next-level progress bar
+        
         progress = (self.score % POINTS_PER_LEVEL) / POINTS_PER_LEVEL
         pygame.draw.rect(self.screen, (40, 45, 70), (WIDTH - 164, 44, 150, 8), border_radius=4)
         pygame.draw.rect(self.screen, YELLOW, (WIDTH - 164, 44, int(150 * progress), 8), border_radius=4)
-        # lives as small ship icons
+        
         for i in range(p.lives):
             x = WIDTH // 2 - (p.lives * 26) // 2 + i * 26 + 13
             pygame.draw.polygon(self.screen, CYAN, [(x, 14), (x + 9, 34), (x - 9, 34)])
-        # bonus rockets in stock
+        
         self.draw_text("ROCKET [B]", self.font_small, ORANGE, topleft=(14, 66))
         for i in range(p.rockets):
             rx = 150 + i * 22
             pygame.draw.rect(self.screen, WHITE, (rx, 66, 8, 18), border_radius=3)
             pygame.draw.polygon(self.screen, RED, [(rx, 66), (rx + 8, 66), (rx + 4, 58)])
-        # active power-ups
+        
         y = HEIGHT - 28
         if p.rapid > 0:
             self.draw_text(f"RAPID FIRE {p.rapid:0.1f}s", self.font_small, YELLOW, topleft=(14, y))
@@ -778,21 +908,48 @@ class Game:
             self.draw_text("MUTED (M)", self.font_small, GREY, topright=(WIDTH - 14, HEIGHT - 28))
 
     def draw_title(self):
-        self.draw_text("STAR DEFENDER", self.font_big, CYAN, center=(WIDTH // 2, 150))
-        self.draw_text("OBJECTIVE", self.font, YELLOW, center=(WIDTH // 2, 240))
+        self.draw_text("STAR DEFENDER", self.font_big, CYAN, center=(WIDTH // 2, 70))
+        
+        # Global leaderboard is always visible; network requests run in the background.
+        panel = pygame.Surface((320, 160), pygame.SRCALPHA)
+        panel.fill((15, 20, 35, 200))
+        pygame.draw.rect(panel, CYAN, panel.get_rect(), 1, border_radius=4)
+        self.screen.blit(panel, (WIDTH // 2 - 160, 130))
+        title = "ONLINE LEADERBOARD" if self.save.global_scores else "GLOBAL LEADERBOARD"
+        self.draw_text(title, self.font_small, ORANGE, center=(WIDTH // 2, 145))
+        if self.save.global_scores:
+            for idx, entry in enumerate(self.save.global_scores[:4]):
+                line = f"{idx+1}. {entry['name']:<10} {entry['score']:>6}"
+                self.draw_text(line, self.font_small, WHITE, center=(WIDTH // 2, 170 + idx * 22))
+        else:
+            status = self.save.online_status
+            color = GREEN if status.startswith("ONLINE") else GREY
+            self.draw_text(status[:34], self.font_small, color, center=(WIDTH // 2, 190))
+            if status.startswith("OFFLINE"):
+                self.draw_text("PLAY IS STILL AVAILABLE", self.font_small, WHITE, center=(WIDTH // 2, 216))
+
+        self.draw_text("OBJECTIVE", self.font, YELLOW, center=(WIDTH // 2, 310))
         for i, line in enumerate(["Destroy the invading ships and asteroids.",
                                   "Survive as long as you can: every 300 points",
                                   "starts a harder level. Lose all 3 lives = game over."]):
-            self.draw_text(line, self.font_small, WHITE, center=(WIDTH // 2, 275 + i * 26))
-        self.draw_text("CONTROLS", self.font, YELLOW, center=(WIDTH // 2, 385))
+            self.draw_text(line, self.font_small, WHITE, center=(WIDTH // 2, 340 + i * 22))
+            
+        self.draw_text("CONTROLS", self.font, YELLOW, center=(WIDTH // 2, 420))
         for i, line in enumerate(["Arrows / WASD - move       SPACE - shoot",
                                   "P - pause      M - mute      ESC - quit",
                                   "Pick-ups:  R rapid fire   S shield   + extra life",
                                   "B - BONUS ROCKET: wipes out every enemy on screen"]):
-            self.draw_text(line, self.font_small, WHITE, center=(WIDTH // 2, 420 + i * 26))
+            self.draw_text(line, self.font_small, WHITE, center=(WIDTH // 2, 450 + i * 22))
+        
+        # Player Profile Input
+        name_str = f"ENTER NAME: < {self.save.player_name} >"
+        self.draw_text(name_str, self.font, CYAN, center=(WIDTH // 2, 560))
+        
         if int(pygame.time.get_ticks() / 500) % 2 == 0:
-            self.draw_text("PRESS ENTER TO START", self.font, GREEN, center=(WIDTH // 2, 560))
-        self.draw_text(f"High score: {self.save.high_score}", self.font, WHITE, center=(WIDTH // 2, 610))
+            self.draw_text("PRESS ENTER TO START", self.font, GREEN, center=(WIDTH // 2, 600))
+            
+        cur_best = self.save.device_scores.get(self.save.player_name, self.save.high_score)
+        self.draw_text(f"High score ({self.save.player_name}): {cur_best}", self.font_small, GREY, center=(WIDTH // 2, 640))
 
 
 if __name__ == "__main__":
