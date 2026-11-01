@@ -1,32 +1,6 @@
-"""
-EF101-P05  -  Python-Based 2D Game: "STAR DEFENDER" (space shooter)
-
-Run:      pip install pygame
-          python space_shooter.py
-
-Controls: Arrow keys / WASD  move          SPACE  shoot
-          P  pause/resume    M  mute/unmute
-          B  (or X) fire the BONUS ROCKET - destroys ALL enemies on screen
-          ENTER  start       R  restart (after game over)    ESC  back / quit
-
-All graphics are drawn with code and all sounds are synthesised at start-up,
-so the game uses NO copyrighted or external assets.
-
-Where each concept from "Required Understanding" lives in the code
-------------------------------------------------------------------
-* Game loop ........ Game.run()             (events -> update -> draw, every frame)
-* Frame updates ... Game.update(dt)         (moves every object by speed * dt)
-* Input events .... Game.handle_events()    (KEYDOWN) and Player.handle_input() (held keys)
-* State/variables . Game.state              (TITLE / PLAYING / PAUSED / GAME_OVER)
-* Collisions ....... Game.check_collisions() (rectangle overlap tests)
-* Coordinates ...... (0,0) is the TOP-LEFT of the window; x grows right, y grows DOWN
-* Timing/FPS ....... clock.tick(FPS) caps at 60 fps; dt = seconds since last frame
-* Asset loading .... SaveData (JSON file on disk) and SoundManager (sounds generated
-                     in memory). If you add PNG/WAV files, load them with
-                     pygame.image.load / pygame.mixer.Sound from an "assets" folder.
-"""
 
 import array
+import datetime
 import json
 import math
 import os
@@ -40,7 +14,27 @@ import pygame
 # --------------------------------------------------------------------------
 WIDTH, HEIGHT = 800, 700
 FPS = 60
-SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "savedata.json")
+
+
+def _save_path():
+    """Where savedata.json lives.
+
+    Normal run:   next to space_shooter.py.
+    Built .exe:   next to the .exe (NOT __file__, which points to a temporary folder that
+                  PyInstaller deletes on exit - the high score would be lost). If that folder
+                  is not writable (e.g. Program Files), use %APPDATA%\\StarDefender instead.
+    """
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    if not os.access(base, os.W_OK):
+        base = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "StarDefender")
+        os.makedirs(base, exist_ok=True)
+    return os.path.join(base, "savedata.json")
+
+
+SAVE_FILE = _save_path()
 POINTS_PER_LEVEL = 300          # score needed to advance one level
 START_LIVES = 3
 MAX_LIVES = 5
@@ -57,35 +51,128 @@ ORANGE = (255, 150, 60)
 PURPLE = (180, 110, 255)
 GREY = (140, 145, 165)
 
+MAX_NAME_LEN = 12               # longest player name
+LEADERBOARD_SIZE = 10           # rows shown on the leaderboard
+MENU_ROWS = 8                   # player rows visible in the select menu
+
 TITLE, PLAYING, PAUSED, GAME_OVER = "title", "playing", "paused", "game_over"
+SELECT_USER, NAME_ENTRY, LEADERBOARD = "select_user", "name_entry", "leaderboard"
 
 
 # --------------------------------------------------------------------------
 # Persistent storage (high score + settings)
 # --------------------------------------------------------------------------
 class SaveData:
-    """Stores the high score and the mute setting in savedata.json."""
+    """Stores every player's record, the last player and the mute setting in savedata.json.
+
+    File layout:
+        {"muted": false, "last_user": "Ali",
+         "users": {"Ali": {"high_score": 420, "best_level": 2,
+                           "games_played": 5, "last_played": "2025-01-31"}}}
+    """
 
     def __init__(self):
-        self.high_score = 0
         self.muted = False
+        self.last_user = None
+        self.users = {}
         self.load()
 
+    # ---- file access ------------------------------------------------------
     def load(self):
         try:
             with open(SAVE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            self.high_score = int(data.get("high_score", 0))
-            self.muted = bool(data.get("muted", False))
+            if not isinstance(data, dict):
+                raise ValueError("unexpected file layout")
+        except FileNotFoundError:
+            return                      # first run -> keep defaults
         except (OSError, ValueError):
-            pass  # first run or corrupted file -> keep defaults
+            self._backup_corrupt_file()
+            return
+        self.muted = bool(data.get("muted", False))
+        users = data.get("users")
+        if isinstance(users, dict):
+            for name, rec in users.items():
+                if not isinstance(rec, dict):
+                    continue
+                try:
+                    self.users[str(name)[:MAX_NAME_LEN]] = {
+                        "high_score": max(0, int(rec.get("high_score", 0))),
+                        "best_level": max(1, int(rec.get("best_level", 1))),
+                        "games_played": max(0, int(rec.get("games_played", 0))),
+                        "last_played": str(rec.get("last_played", "")),
+                    }
+                except (TypeError, ValueError):
+                    continue
+        last = data.get("last_user")
+        self.last_user = self.find_user(last) if isinstance(last, str) else None
+
+    def _backup_corrupt_file(self):
+        """Keep an unreadable save file as savedata.json.bak instead of overwriting it."""
+        try:
+            os.replace(SAVE_FILE, SAVE_FILE + ".bak")
+            print("Warning: save file was unreadable - kept a copy as savedata.json.bak")
+        except OSError:
+            pass
 
     def save(self):
+        data = {"muted": self.muted, "last_user": self.last_user, "users": self.users}
+        tmp = SAVE_FILE + ".tmp"
         try:
-            with open(SAVE_FILE, "w", encoding="utf-8") as f:
-                json.dump({"high_score": self.high_score, "muted": self.muted}, f)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, SAVE_FILE)  # atomic: a crash can never leave a half-written file
         except OSError:
             print("Warning: could not write save file.")
+
+    # ---- users ------------------------------------------------------------
+    def find_user(self, name):
+        """Case-insensitive lookup. Returns the stored spelling of the name, or None."""
+        for stored in self.users:
+            if stored.lower() == name.strip().lower():
+                return stored
+        return None
+
+    def add_user(self, name):
+        name = name.strip()[:MAX_NAME_LEN]
+        existing = self.find_user(name)
+        if existing:
+            return existing
+        self.users[name] = {"high_score": 0, "best_level": 1, "games_played": 0, "last_played": ""}
+        self.save()
+        return name
+
+    def user_names(self):
+        return sorted(self.users, key=str.lower)
+
+    def best_of(self, name):
+        return self.users[name]["high_score"] if name in self.users else 0
+
+    # ---- scores / leaderboard --------------------------------------------
+    def record_score(self, name, score, level):
+        """Store a finished game. Returns (new_personal_best, leaderboard_rank)."""
+        rec = self.users[name]
+        new_best = score > rec["high_score"]
+        if new_best:
+            rec["high_score"] = score
+            rec["best_level"] = level
+        rec["games_played"] += 1
+        rec["last_played"] = datetime.date.today().isoformat()
+        self.last_user = name
+        self.save()
+        return new_best, self.rank_of(name)
+
+    def ranking(self):
+        """[(name, record), ...] for players who have played, best score first."""
+        played = [(n, r) for n, r in self.users.items() if r["games_played"] > 0]
+        played.sort(key=lambda item: (-item[1]["high_score"], item[0].lower()))
+        return played
+
+    def rank_of(self, name):
+        for i, (n, _) in enumerate(self.ranking()):
+            if n == name:
+                return i + 1
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -424,6 +511,13 @@ class Game:
         self.font_big = pygame.font.SysFont("consolas,couriernew,monospace", 64, bold=True)
 
         self.save = SaveData()
+        self.current_user = self.save.last_user   # whoever played last is pre-selected
+        self.menu_index = 0                       # highlighted row in the player menu
+        self.menu_origin = TITLE                  # screen to return to when the menu is closed
+        self.select_starts_game = False           # start playing right after choosing a player?
+        self.name_input = ""                      # text typed on the "new player" screen
+        self.board_origin = TITLE                 # screen to return to from the leaderboard
+        self.last_rank = None                     # leaderboard rank after the latest game
         self.sound = SoundManager(self.save.muted)
         self.stars = Starfield()
         self.player = Player()
@@ -445,16 +539,32 @@ class Game:
         self.flash = 0.0             # white screen-flash timer for the blast
         self.rocket_reward = False   # show "+1 ROCKET" on the level banner
         self.new_high = False
+        self.score_saved = False     # has this run's score been written to savedata.json yet?
         self.state = PLAYING
 
     def end_game(self):
         self.state = GAME_OVER
         self.rocket = None
         self.sound.play("gameover")
-        if self.score > self.save.high_score:
-            self.save.high_score = self.score
-            self.new_high = True
-        self.save.save()
+        self.new_high, self.last_rank = self.save.record_score(self.current_user, self.score, self.level)
+        self.score_saved = True
+
+    def save_progress(self):
+        """Write the score of a run that is still in progress to savedata.json.
+
+        Called whenever a run is abandoned (Main Menu, restart, quit, window closed) so a
+        high score is never lost just because the player did not reach GAME OVER.
+        """
+        if (self.state in (PLAYING, PAUSED) and not self.score_saved
+                and self.score > 0 and self.current_user in self.save.users):
+            self.new_high, self.last_rank = self.save.record_score(self.current_user, self.score, self.level)
+            self.score_saved = True
+
+    def go_to_main_menu(self):
+        """X key: leave the current game and return to the Main Menu (title screen)."""
+        self.save_progress()
+        self.rocket = None
+        self.state = TITLE
 
     def toggle_mute(self):
         self.sound.toggle_mute()
@@ -473,9 +583,45 @@ class Game:
             pygame.display.flip()
 
     def quit(self):
+        self.save_progress()     # keep the score of a run that is still in progress
         self.save.save()
         pygame.quit()
         sys.exit()
+
+    # ---- player / menu helpers ---------------------------------------------
+    def start_or_pick_player(self):
+        """ENTER on the title screen: play as the current player, or ask who is playing."""
+        if self.current_user:
+            self.new_game()
+        else:
+            self.open_select(TITLE, start=True)
+
+    def open_select(self, origin, start=False):
+        self.menu_origin = origin
+        self.select_starts_game = start
+        names = self.save.user_names()
+        if not names:
+            self.open_name_entry()
+            return
+        self.menu_index = names.index(self.current_user) if self.current_user in names else 0
+        self.state = SELECT_USER
+
+    def open_name_entry(self):
+        self.name_input = ""
+        self.state = NAME_ENTRY
+
+    def choose_user(self, name):
+        self.current_user = name
+        self.save.last_user = name
+        self.save.save()
+        if self.select_starts_game:
+            self.new_game()
+        else:
+            self.state = TITLE
+
+    def open_leaderboard(self, origin):
+        self.board_origin = origin
+        self.state = LEADERBOARD
 
     # ---- input -------------------------------------------------------------
     def handle_events(self):
@@ -485,28 +631,74 @@ class Game:
             if event.type != pygame.KEYDOWN:
                 continue
             key = event.key
+            if self.state == NAME_ENTRY:      # typing a name: letters must not trigger shortcuts
+                self.handle_name_entry(event)
+                continue
             if key == pygame.K_m:
                 self.toggle_mute()
             if self.state == TITLE:
                 if key in (pygame.K_RETURN, pygame.K_SPACE):
-                    self.new_game()
+                    self.start_or_pick_player()
+                elif key == pygame.K_u:
+                    self.open_select(TITLE)
+                elif key == pygame.K_l:
+                    self.open_leaderboard(TITLE)
                 elif key == pygame.K_ESCAPE:
                     self.quit()
+            elif self.state == SELECT_USER:
+                names = self.save.user_names()
+                if key in (pygame.K_UP, pygame.K_w):
+                    self.menu_index = (self.menu_index - 1) % len(names)
+                elif key in (pygame.K_DOWN, pygame.K_s):
+                    self.menu_index = (self.menu_index + 1) % len(names)
+                elif key in (pygame.K_RETURN, pygame.K_SPACE):
+                    self.choose_user(names[self.menu_index])
+                elif key == pygame.K_n:
+                    self.open_name_entry()
+                elif key == pygame.K_ESCAPE:
+                    self.state = self.menu_origin
+            elif self.state == LEADERBOARD:
+                if key in (pygame.K_ESCAPE, pygame.K_RETURN, pygame.K_l):
+                    self.state = self.board_origin
             elif self.state == PLAYING:
-                if key in (pygame.K_p, pygame.K_ESCAPE):
+                if key == pygame.K_x:
+                    self.go_to_main_menu()
+                elif key in (pygame.K_p, pygame.K_ESCAPE):
                     self.state = PAUSED
-                elif key in (pygame.K_b, pygame.K_x):
+                elif key == pygame.K_b:
                     self.fire_rocket()
             elif self.state == PAUSED:
-                if key in (pygame.K_p, pygame.K_ESCAPE):
+                if key == pygame.K_x:
+                    self.go_to_main_menu()
+                elif key in (pygame.K_p, pygame.K_ESCAPE):
                     self.state = PLAYING
                 elif key == pygame.K_r:
+                    self.save_progress()      # restarting abandons this run - keep its score
                     self.new_game()
             elif self.state == GAME_OVER:
                 if key in (pygame.K_r, pygame.K_RETURN):
                     self.new_game()
-                elif key == pygame.K_ESCAPE:
-                    self.state = TITLE
+                elif key == pygame.K_u:
+                    self.open_select(GAME_OVER, start=True)   # hand over to the next player
+                elif key == pygame.K_l:
+                    self.open_leaderboard(GAME_OVER)
+                elif key in (pygame.K_x, pygame.K_ESCAPE):
+                    self.go_to_main_menu()
+
+    def handle_name_entry(self, event):
+        key = event.key
+        if key == pygame.K_RETURN:
+            name = self.name_input.strip()
+            if name:   # an existing name (any capitalisation) simply selects that player
+                self.choose_user(self.save.add_user(name))
+        elif key == pygame.K_ESCAPE:
+            self.state = SELECT_USER if self.save.users else self.menu_origin
+        elif key == pygame.K_BACKSPACE:
+            self.name_input = self.name_input[:-1]
+        else:
+            ch = event.unicode
+            if ch and ch.isascii() and (ch.isalnum() or ch in " _-") and len(self.name_input) < MAX_NAME_LEN:
+                self.name_input += ch
 
     # ---- update ------------------------------------------------------------
     def update(self, dt):
@@ -707,6 +899,15 @@ class Game:
         if self.state == TITLE:
             self.draw_title()
             return
+        if self.state == SELECT_USER:
+            self.draw_select_user()
+            return
+        if self.state == NAME_ENTRY:
+            self.draw_name_entry()
+            return
+        if self.state == LEADERBOARD:
+            self.draw_leaderboard()
+            return
 
         for pu in self.powerups:
             pu.draw(self.screen)
@@ -733,11 +934,13 @@ class Game:
             if self.rocket_reward:
                 self.draw_text("+1 ROCKET", self.font, ORANGE, center=(WIDTH // 2, HEIGHT // 3 + 55))
         if self.state == PAUSED:
-            self.draw_overlay("PAUSED", ["P - resume", "R - restart", "M - mute"])
+            self.draw_overlay("PAUSED", ["P - resume", "R - restart", "X - main menu", "M - mute"])
         elif self.state == GAME_OVER:
-            lines = [f"Score: {self.score}   Level: {self.level}",
-                     "NEW HIGH SCORE!" if self.new_high else f"High score: {self.save.high_score}",
-                     "R - play again    ESC - title screen"]
+            lines = [f"{self.current_user}:  Score {self.score}   Level {self.level}",
+                     "NEW PERSONAL BEST!" if self.new_high else f"Your best: {self.save.best_of(self.current_user)}",
+                     f"Leaderboard rank: #{self.last_rank}" if self.last_rank else "",
+                     "R - play again     U - switch player",
+                     "L - leaderboard    X - main menu"]
             self.draw_overlay("GAME OVER", lines, RED)
 
     def draw_overlay(self, title, lines, color=WHITE):
@@ -746,13 +949,14 @@ class Game:
         self.screen.blit(shade, (0, 0))
         self.draw_text(title, self.font_big, color, center=(WIDTH // 2, HEIGHT // 2 - 90))
         for i, line in enumerate(lines):
-            c = GREEN if line == "NEW HIGH SCORE!" else WHITE
+            c = GREEN if line.startswith("NEW") else WHITE
             self.draw_text(line, self.font, c, center=(WIDTH // 2, HEIGHT // 2 - 10 + i * 40))
 
     def draw_hud(self):
         p = self.player
         self.draw_text(f"SCORE {self.score}", self.font, WHITE, topleft=(14, 10))
-        self.draw_text(f"BEST {max(self.save.high_score, self.score)}", self.font_small, GREY, topleft=(14, 40))
+        best = max(self.save.best_of(self.current_user), self.score)
+        self.draw_text(f"{self.current_user}  BEST {best}", self.font_small, GREY, topleft=(14, 40))
         self.draw_text(f"LEVEL {self.level}", self.font, YELLOW, topright=(WIDTH - 14, 10))
         # next-level progress bar
         progress = (self.score % POINTS_PER_LEVEL) / POINTS_PER_LEVEL
@@ -786,13 +990,82 @@ class Game:
             self.draw_text(line, self.font_small, WHITE, center=(WIDTH // 2, 275 + i * 26))
         self.draw_text("CONTROLS", self.font, YELLOW, center=(WIDTH // 2, 385))
         for i, line in enumerate(["Arrows / WASD - move       SPACE - shoot",
-                                  "P - pause      M - mute      ESC - quit",
+                                  "P - pause   M - mute   X - main menu   ESC - quit",
+                                  "U - switch player        L - leaderboard",
                                   "Pick-ups:  R rapid fire   S shield   + extra life",
                                   "B - BONUS ROCKET: wipes out every enemy on screen"]):
             self.draw_text(line, self.font_small, WHITE, center=(WIDTH // 2, 420 + i * 26))
         if int(pygame.time.get_ticks() / 500) % 2 == 0:
-            self.draw_text("PRESS ENTER TO START", self.font, GREEN, center=(WIDTH // 2, 560))
-        self.draw_text(f"High score: {self.save.high_score}", self.font, WHITE, center=(WIDTH // 2, 610))
+            self.draw_text("PRESS ENTER TO START", self.font, GREEN, center=(WIDTH // 2, 575))
+        if self.current_user:
+            who = f"Player: {self.current_user}   (best {self.save.best_of(self.current_user)})"
+        else:
+            who = "No player selected yet"
+        self.draw_text(who, self.font, WHITE, center=(WIDTH // 2, 625))
+
+    def draw_select_user(self):
+        names = self.save.user_names()
+        self.draw_text("SELECT PLAYER", self.font_big, CYAN, center=(WIDTH // 2, 100))
+        first = min(max(0, self.menu_index - MENU_ROWS // 2), max(0, len(names) - MENU_ROWS))
+        for row, name in enumerate(names[first:first + MENU_ROWS]):
+            y = 190 + row * 44
+            selected = first + row == self.menu_index
+            if selected:
+                pygame.draw.rect(self.screen, (30, 50, 90), (170, y - 18, WIDTH - 340, 38), border_radius=6)
+                pygame.draw.rect(self.screen, CYAN, (170, y - 18, WIDTH - 340, 38), 2, border_radius=6)
+            color = YELLOW if selected else WHITE
+            self.draw_text(name, self.font, color, topleft=(190, y - 12))
+            self.draw_text(f"best {self.save.best_of(name)}", self.font_small, GREY, topright=(WIDTH - 190, y - 8))
+        if len(names) > MENU_ROWS:
+            self.draw_text(f"{self.menu_index + 1} / {len(names)}", self.font_small, GREY,
+                           center=(WIDTH // 2, 190 + MENU_ROWS * 44))
+        self.draw_text("UP/DOWN - choose     ENTER - select", self.font_small, WHITE, center=(WIDTH // 2, HEIGHT - 90))
+        self.draw_text("N - new player     ESC - back", self.font_small, WHITE, center=(WIDTH // 2, HEIGHT - 60))
+
+    def draw_name_entry(self):
+        self.draw_text("NEW PLAYER", self.font_big, CYAN, center=(WIDTH // 2, 150))
+        self.draw_text("Type your name and press ENTER", self.font, WHITE, center=(WIDTH // 2, 260))
+        box = pygame.Rect(0, 0, 420, 56)
+        box.center = (WIDTH // 2, 340)
+        pygame.draw.rect(self.screen, (20, 25, 50), box, border_radius=8)
+        pygame.draw.rect(self.screen, CYAN, box, 2, border_radius=8)
+        cursor = "_" if int(pygame.time.get_ticks() / 400) % 2 == 0 else " "
+        self.draw_text(self.name_input + cursor, self.font, YELLOW, center=box.center)
+        self.draw_text(f"letters, numbers, space, - and _   (max {MAX_NAME_LEN})", self.font_small, GREY,
+                       center=(WIDTH // 2, 395))
+        self.draw_text("ENTER - confirm     ESC - cancel", self.font_small, WHITE, center=(WIDTH // 2, HEIGHT - 70))
+
+    def draw_leaderboard(self):
+        self.draw_text("LEADERBOARD", self.font_big, CYAN, center=(WIDTH // 2, 90))
+        top = 160
+        self.draw_text("RANK", self.font_small, GREY, topleft=(110, top))
+        self.draw_text("PLAYER", self.font_small, GREY, topleft=(200, top))
+        self.draw_text("SCORE", self.font_small, GREY, topright=(530, top))
+        self.draw_text("LEVEL", self.font_small, GREY, topright=(620, top))
+        self.draw_text("GAMES", self.font_small, GREY, topright=(710, top))
+        pygame.draw.line(self.screen, GREY, (100, top + 28), (WIDTH - 90, top + 28), 1)
+        board = self.save.ranking()
+        if not board:
+            self.draw_text("No scores yet - be the first!", self.font, WHITE, center=(WIDTH // 2, 330))
+        for i, (name, rec) in enumerate(board[:LEADERBOARD_SIZE]):
+            self.draw_board_row(top + 48 + i * 34, i + 1, name, rec)
+        rank = self.save.rank_of(self.current_user) if self.current_user else None
+        if rank and rank > LEADERBOARD_SIZE:   # always show where the current player stands
+            y = top + 48 + LEADERBOARD_SIZE * 34 + 6
+            self.draw_text("...", self.font_small, GREY, topleft=(110, y - 12))
+            self.draw_board_row(y + 12, rank, self.current_user, self.save.users[self.current_user])
+        self.draw_text("ESC - back", self.font_small, WHITE, center=(WIDTH // 2, HEIGHT - 40))
+
+    def draw_board_row(self, y, rank, name, rec):
+        if name == self.current_user:
+            color = GREEN
+        else:
+            color = YELLOW if rank == 1 else WHITE
+        self.draw_text(f"#{rank}", self.font_small, color, topleft=(110, y))
+        self.draw_text(name, self.font_small, color, topleft=(200, y))
+        self.draw_text(str(rec["high_score"]), self.font_small, color, topright=(530, y))
+        self.draw_text(str(rec["best_level"]), self.font_small, color, topright=(620, y))
+        self.draw_text(str(rec["games_played"]), self.font_small, color, topright=(710, y))
 
 
 if __name__ == "__main__":
