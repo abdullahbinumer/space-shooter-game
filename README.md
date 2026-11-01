@@ -9,7 +9,7 @@
 
 ## 1. Overview
 
-Space Shooter is a single-player arcade shooter. The player pilots a ship at the bottom of the screen and must destroy waves of invading ships and asteroids. Every 300 points the game moves to a harder level, with no upper limit. The run ends when all lives are lost, and the best score is saved to a file so it persists between sessions.
+Space Shooter is a single-player arcade shooter. The player pilots a ship at the bottom of the screen and must destroy waves of invading ships and asteroids. Every 300 points the game moves to a harder level, with no upper limit. The run ends when all lives are lost, and the best score is saved to a file so it persists between sessions
 
 The game is available in three forms:
 
