@@ -50,7 +50,7 @@ Open the itch.io page and click the game once so the keyboard works. Desktop bro
 |---|---|
 | Arrow keys / **W A S D** | Move the ship |
 | **Space** | Shoot (hold for continuous fire) |
-| **B** or **X** | Fire the bonus rocket |
+| **B** | Fire the bonus rocket |
 | **P** | Pause / resume |
 | **M** | Mute / unmute sound |
 | **Enter** | Start the game (title screen) / Select option |
@@ -59,6 +59,7 @@ Open the itch.io page and click the game once so the keyboard works. Desktop bro
 | **L** | Open Leaderboard |
 | **R** | Restart (after game over, or from the pause screen) |
 | **Esc** | Pause while playing; back to title from game over; quit from title screen |
+| **X** | Main Menu |
 | **E** | *(browser version)* Download the high score as `savedata.json` |
 | **L** | *(browser version)* Load a previously saved `savedata.json` |
 
@@ -105,7 +106,7 @@ Each destroyed enemy has a 13 % chance to drop a power-up that falls down the sc
 | **+** (green) | Extra life | +1 life, up to the maximum of 5 |
 
 ### 4.5 Bonus rocket
-- Press **B** (or **X**) to launch a rocket straight up. You start with 1 and can hold up to 3; a new one is earned every level.
+- Press **B** to launch a rocket straight up. You start with 1 and can hold up to 3; a new one is earned every level.
 - It explodes when it hits an enemy or reaches the upper part of the screen.
 - The blast **destroys every enemy and every enemy bullet on screen**. You still score the points for each enemy destroyed, but no power-ups drop.
 - Only one rocket can be in flight at a time.
